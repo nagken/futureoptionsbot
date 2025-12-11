@@ -1,0 +1,48 @@
+# Options Scalper Configuration
+# Fast scalping of MES/MNQ options with smart stops
+
+# Trading Parameters
+# Futures symbols to trade (both Micro S&P and Micro Nasdaq)
+symbols:
+  - MES
+  - MNQ
+expiry: "20251219"  # Update with current weekly expiration
+
+# Account Settings
+account_balance: 10000
+position_size: 1  # Number of option contracts per trade
+
+# Risk Management
+stop_loss_multiplier: 1.0      # 1.0 = standard stop (15% from entry)
+profit_target_multiplier: 2.0  # 2.0 = 2x risk (30% from entry)
+trailing_stop_pct: 0.10        # Trail by 10% from highest price
+max_daily_loss_pct: 0.10       # Stop trading at 10% daily loss
+
+# Trading Rules
+max_trades_per_day: 50         # Maximum scalps per day
+cooldown_seconds: 10           # Wait time between trades
+allow_reversals: true          # Can reverse from CALL to PUT and vice versa
+min_momentum_strength: 0.6     # 0-1, higher = stronger signal required
+
+# Scalping Strategy
+strike_selection: "ATM_MINUS_5"  # Slightly ITM for better delta
+entry_speed: "MARKET"            # MARKET for fast fills
+exit_speed: "MARKET"             # MARKET for fast exits
+
+# Time Management
+start_time: "09:35"    # Start trading after open
+end_time: "15:45"      # Stop before close
+avoid_first_5min: true # Skip first 5 minutes (high volatility)
+
+# Smart Features
+auto_breakeven: true          # Move stop to breakeven at 10% profit
+scale_out_enabled: false      # Take partial profits (50% at 15% gain)
+max_holding_time_minutes: 15  # Force exit after 15 minutes
+
+# IBKR Connection
+port: 7496
+client_id: 30  # Changed from 20 to avoid conflict
+
+# Logging
+verbose_logging: true
+log_all_ticks: false  # Warning: Creates large log files

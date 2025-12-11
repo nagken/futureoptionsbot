@@ -1,0 +1,44 @@
+# 
+# Options Bot Configuration
+# 
+
+# Trading Parameters
+symbol: "MES" # MES futures options
+strategy: "iron_condor" # Strategy type
+timeframe: "weekly" # Weekly options
+
+# Account Settings
+account_balance: 5000
+risk_per_trade: 0.30 # 30% max per trade
+max_positions: 3 # Max 3 iron condors at once
+
+# Iron Condor Settings
+delta_target: 0.15 # Sell at 15 delta (85% prob of profit)
+wing_width: 10 # 10 between short and long strikes
+target_premium: 100 # Target 100 premium per condor
+days_to_expiration: 7 # Use weekly options (7 DTE)
+
+# Risk Management
+profit_target: 0.50 # Close at 50% profit
+stop_loss: 2.0 # Close if loss 2x premium collected
+adjustment_trigger: 0.30 # Adjust if delta reaches 0.30
+max_daily_loss: 0.10 # Stop trading if down 10% for day
+
+# Entry Rules
+min_iv_rank: 20 # Enter when IV rank 20
+market_condition: "neutral" # Prefer neutral/sideways markets
+trading_hours: "09:30-15:00" # Only trade during liquid hours
+
+# Exit Rules
+hold_to_expiration: false # Close early if profitable
+dte_close: 2 # Close 2 days before expiration
+manage_winners: true # Take profits early
+
+# Broker Settings
+broker: "ibkr"
+port: 7496
+client_id: 10 # Different from futures bot (ID 3)
+
+# Logging
+log_trades: true
+log_directory: "logs"

@@ -1,0 +1,18 @@
+# 
+# Futures Bot Configuration
+# 
+
+symbol: "MES" # MES or MNQ
+timeframe: "5m" # Candlestick interval
+ema_fast: 9
+ema_slow: 21
+atr_period: 14
+risk_per_trade: 0.01 # 1% of account
+account_balance: 5000
+daily_drawdown_limit: 0.10 # 10%
+max_open_positions: 1
+max_trades_per_day: 10
+stop_loss_multiplier: 1.5
+take_profit_multiplier: 3
+broker: "ibkr"
+log_to_cloud: false
