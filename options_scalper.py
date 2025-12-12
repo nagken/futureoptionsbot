@@ -220,8 +220,8 @@ def connect_bot(bot, port=7496, client_id=25):
 
 def detect_momentum(price_history, period=20):
     """
-    Detect momentum direction using recent price action
-    Returns: 'BULLISH', 'BEARISH', or 'NEUTRAL'
+    Detect momentum direction AND reversals using recent price action
+    Returns: 'BULLISH', 'BEARISH', 'REVERSAL_UP', 'REVERSAL_DOWN', or 'NEUTRAL'
     """
     if len(price_history) < period:
         return 'NEUTRAL'
@@ -236,7 +236,20 @@ def detect_momentum(price_history, period=20):
     up_moves = sum(1 for i in range(1, len(prices)) if prices[i] > prices[i-1])
     momentum_score = up_moves / (len(prices) - 1)
     
-    # More aggressive thresholds for testing
+    # Calculate recent momentum (last 5 bars for reversal detection)
+    if len(prices) >= 10:
+        recent_5 = prices[-5:]
+        older_5 = prices[-10:-5]
+        recent_roc = (recent_5[-1] - recent_5[0]) / recent_5[0] * 100
+        older_roc = (older_5[-1] - older_5[0]) / older_5[0] * 100
+        
+        # Detect REVERSALS - when trend switches gears
+        if older_roc < -0.1 and recent_roc > 0.2:  # Was falling, now rising
+            return 'REVERSAL_UP'
+        elif older_roc > 0.1 and recent_roc < -0.2:  # Was rising, now falling
+            return 'REVERSAL_DOWN'
+    
+    # Detect TREND CONTINUATION
     if roc > 0.15 and momentum_score > 0.55:
         return 'BULLISH'
     elif roc < -0.15 and momentum_score < 0.45:
@@ -268,7 +281,7 @@ def find_scalping_strike(current_price, direction, offset_pct=0.005):
 
 def calculate_stops(entry_price, direction, atr, config):
     """
-    Calculate stop loss and profit target
+    Calculate tight stop loss and profit target to minimize losses
     
     Args:
         entry_price: Entry price of option
@@ -279,8 +292,10 @@ def calculate_stops(entry_price, direction, atr, config):
     stop_multiplier = config.get('stop_loss_multiplier', 1.0)
     target_multiplier = config.get('profit_target_multiplier', 2.0)
     
-    stop_distance = entry_price * 0.15 * stop_multiplier  # 15% stop
-    target_distance = entry_price * 0.30 * target_multiplier  # 30% target
+    # TIGHTER STOPS - 10% max loss to keep losses minimal
+    stop_distance = entry_price * 0.10 * stop_multiplier
+    # Good profit target - 25% gain
+    target_distance = entry_price * 0.25 * target_multiplier
     
     stop_loss = entry_price - stop_distance
     profit_target = entry_price + target_distance
@@ -333,7 +348,9 @@ def place_scalp_order(bot, symbol, expiry, strike, direction, quantity=1):
     order.action = "BUY"
     order.totalQuantity = quantity
     order.orderType = "MKT"
-    order.tif = "GTC"
+    order.tif = "DAY"
+    order.eTradeOnly = False
+    order.firmQuoteOnly = False
     
     orderId = bot.nextOrderId
     bot.placeOrder(orderId, contract, order)
@@ -360,7 +377,9 @@ def close_position(bot, symbol, expiry, strike, direction, quantity=1):
     order.action = "SELL"
     order.totalQuantity = quantity
     order.orderType = "MKT"
-    order.tif = "GTC"
+    order.tif = "DAY"
+    order.eTradeOnly = False
+    order.firmQuoteOnly = False
     
     orderId = bot.nextOrderId
     bot.placeOrder(orderId, contract, order)
@@ -444,34 +463,35 @@ def scalping_loop(bot, symbols, expiry):
             
             # Check if in position
             if in_position:
-                # Update trailing stop
-                new_stop = update_trailing_stop(bot, current_price, entry_price)
+                # Update trailing stop to lock in profits
+                new_stop = update_trailing_stop(bot, current_price, entry_price, trailing_pct=0.08)
                 if new_stop and new_stop > stop_loss:
+                    old_stop = stop_loss
                     stop_loss = new_stop
-                    logger.info(f"[TRAIL] Stop updated: ${stop_loss:.2f}")
+                    logger.info(f"[TRAIL] Stop moved: ${old_stop:.2f} → ${stop_loss:.2f} (locking profit)")
                 
                 # Check exit conditions
                 should_exit = False
                 exit_reason = ""
                 
-                # Profit target hit
+                # Profit target hit - take the win!
                 if current_price >= profit_target:
                     should_exit = True
                     exit_reason = "Profit target"
                 
-                # Stop loss hit
+                # Stop loss hit - minimize loss
                 elif current_price <= stop_loss:
                     should_exit = True
                     exit_reason = "Stop loss"
                 
-                # Reversal signal
+                # REVERSAL DETECTED - switch gears and exit to catch opposite direction
                 elif allow_reversals:
-                    if signal == 'BULLISH' and current_direction == 'PUT':
+                    if signal in ['REVERSAL_DOWN', 'BEARISH'] and current_direction == 'CALL':
                         should_exit = True
-                        exit_reason = "Reversal signal (BULLISH)"
-                    elif signal == 'BEARISH' and current_direction == 'CALL':
+                        exit_reason = "Reversal DOWN detected - switching to PUT"
+                    elif signal in ['REVERSAL_UP', 'BULLISH'] and current_direction == 'PUT':
                         should_exit = True
-                        exit_reason = "Reversal signal (BEARISH)"
+                        exit_reason = "Reversal UP detected - switching to CALL"
                 
                 if should_exit:
                     logger.info(f"EXIT: {exit_reason}")
@@ -487,9 +507,13 @@ def scalping_loop(bot, symbols, expiry):
                     time.sleep(1)
                     continue
                 
-                # Check for entry signal
-                if signal == 'BULLISH':
-                    logger.info("[SIGNAL] BULLISH detected")
+                # Check for entry signal - TREND or REVERSAL
+                if signal in ['BULLISH', 'REVERSAL_UP']:
+                    if signal == 'REVERSAL_UP':
+                        logger.info("[SIGNAL] REVERSAL UP detected - catching the switch!")
+                    else:
+                        logger.info("[SIGNAL] BULLISH trend continuation")
+                    
                     current_strike = find_scalping_strike(current_price, 'CALL')
                     current_direction = 'CALL'
                     
@@ -503,8 +527,12 @@ def scalping_loop(bot, symbols, expiry):
                     
                     logger.info(f"Entry: ${entry_price:.2f} | Stop: ${stop_loss:.2f} | Target: ${profit_target:.2f}")
                     
-                elif signal == 'BEARISH':
-                    logger.info("[SIGNAL] BEARISH detected")
+                elif signal in ['BEARISH', 'REVERSAL_DOWN']:
+                    if signal == 'REVERSAL_DOWN':
+                        logger.info("[SIGNAL] REVERSAL DOWN detected - catching the switch!")
+                    else:
+                        logger.info("[SIGNAL] BEARISH trend continuation")
+                    
                     current_strike = find_scalping_strike(current_price, 'PUT')
                     current_direction = 'PUT'
                     
