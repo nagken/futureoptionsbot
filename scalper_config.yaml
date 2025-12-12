@@ -6,7 +6,8 @@
 symbols:
   - MES
   - MNQ
-expiry: "20251219"  # Update with current weekly expiration
+futures_expiry: "202603"    # March 2026 quarterly futures (H26 - next quarterly)
+options_expiry: "202603"    # Options use same expiry as underlying futures
 
 # Account Settings
 account_balance: 10000

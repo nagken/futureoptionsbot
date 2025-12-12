@@ -40,9 +40,15 @@ class OptionsScalper(EWrapper, EClient):
         self.last_price = 0
         self.price_history = deque(maxlen=100)
         
+        # Futures contract tracking
+        self.futures_conIds = {}  # Store qualified futures contract IDs
+        self.contract_details_received = {}  # Track which contract details we've received
+        
         # Options data
-        self.option_chains = {}
+        self.option_chains = {}  # Store available strikes per symbol
         self.option_prices = {}
+        self.chain_data_ready = {}  # Track which symbols have chain data
+        self.next_req_id = 1000  # Start req IDs for option chains
         
         # Position tracking
         self.positions = {}
@@ -72,6 +78,46 @@ class OptionsScalper(EWrapper, EClient):
     def error(self, reqId, errorCode, errorString, advancedOrderRejectJson=""):
         if errorCode not in [2104, 2106, 2158, 2107, 2119]:
             logger.error(f"Error {errorCode}: {errorString}")
+    
+    def contractDetails(self, reqId, contractDetails):
+        """Receive contract details for futures contracts"""
+        if reqId < 100:  # Futures contract detail requests (reqIds 1-99)
+            contract = contractDetails.contract
+            symbol = contract.symbol
+            self.futures_conIds[symbol] = contract.conId
+            logger.info(f"[CONTRACT] {symbol} conId={contract.conId}")
+    
+    def contractDetailsEnd(self, reqId):
+        """Contract details complete"""
+        if reqId < 100:
+            self.contract_details_received[reqId] = True
+    
+    def securityDefinitionOptionParameter(self, reqId, exchange, underlyingConId, tradingClass, multiplier, expirations, strikes):
+        """Receive option chain data from IB"""
+        if reqId >= 1000:  # Our option chain requests
+            symbol_idx = reqId - 1000
+            symbols = self.config.get('symbols', ['MES'])
+            if symbol_idx < len(symbols):
+                symbol = symbols[symbol_idx]
+                logger.info(f"[CHAIN] {symbol} on {exchange}: multiplier={multiplier}, tradingClass={tradingClass}")
+                logger.info(f"[CHAIN] {symbol}: {len(strikes)} strikes, {len(expirations)} expiries")
+                logger.info(f"[CHAIN] {symbol} expiries: {sorted(expirations)[:5]}...")  # Show first 5
+                
+                # Store available strikes and expirations
+                if symbol not in self.option_chains:
+                    self.option_chains[symbol] = {}
+                
+                for expiry in expirations:
+                    if expiry not in self.option_chains[symbol]:
+                        self.option_chains[symbol][expiry] = []
+                    self.option_chains[symbol][expiry] = sorted(strikes)
+                
+                self.chain_data_ready[symbol] = True
+                logger.info(f"[OK] Option chain loaded for {symbol}")
+    
+    def securityDefinitionOptionParameterEnd(self, reqId):
+        """Option chain data complete"""
+        pass
             
     def tickPrice(self, reqId, tickType, price, attrib):
         """Real-time price updates"""
@@ -172,14 +218,18 @@ class OptionsScalper(EWrapper, EClient):
                 self.entry_price = 0
 
 
-def create_option_contract(symbol, expiry, strike, right, multiplier="5"):
-    """Create futures option contract"""
+def create_option_contract(symbol, expiry, strike, right, multiplier="50"):
+    """Create futures option contract - MES/MNQ options use multiplier 50
+    
+    For FOP contracts, use YYYYMM format for expiry (same as underlying futures)
+    Example: "202603" for March 2026
+    """
     contract = Contract()
     contract.symbol = symbol
     contract.secType = "FOP"
     contract.exchange = "CME"
     contract.currency = "USD"
-    contract.lastTradeDateOrContractMonth = expiry
+    contract.lastTradeDateOrContractMonth = expiry  # Use YYYYMM format like "202603"
     contract.strike = strike
     contract.right = right
     contract.multiplier = multiplier
@@ -258,25 +308,50 @@ def detect_momentum(price_history, period=20):
         return 'NEUTRAL'
 
 
-def find_scalping_strike(current_price, direction, offset_pct=0.005):
+def find_scalping_strike(bot, symbol, expiry, current_price, direction):
     """
-    Find optimal strike for scalping
+    Find optimal strike for scalping from REAL available options
     Use ATM or slightly ITM options for high delta/responsiveness
     
     Args:
+        bot: OptionsScalper instance with chain data
+        symbol: Symbol to trade (MES/MNQ)
+        expiry: Target expiration date
         current_price: Current futures price
         direction: 'CALL' or 'PUT'
-        offset_pct: Percentage offset from ATM (0.5% default)
     """
-    atm = round(current_price / 5) * 5
+    # Check if we have chain data
+    if symbol not in bot.option_chains or expiry not in bot.option_chains[symbol]:
+        logger.warning(f"[WARN] No option chain data for {symbol} {expiry}")
+        # Fallback: estimate based on standard intervals
+        interval = 5 if symbol == 'MES' else 50
+        atm = round(current_price / interval) * interval
+        return atm if direction == 'CALL' else atm
+    
+    # Get available strikes for this expiry
+    available_strikes = bot.option_chains[symbol][expiry]
+    
+    if not available_strikes:
+        logger.error(f"[ERROR] No strikes available for {symbol} {expiry}")
+        return None
+    
+    # Find ATM strike from available options
+    atm_strike = min(available_strikes, key=lambda x: abs(x - current_price))
+    
+    logger.info(f"[STRIKE] Price: ${current_price:.2f} | ATM: ${atm_strike} | Available: {len(available_strikes)} strikes")
     
     if direction == 'CALL':
-        # Slightly ITM for better delta
-        strike = atm - 5
+        # Get slightly ITM or ATM for better delta
+        itm_strikes = [s for s in available_strikes if s <= current_price]
+        if itm_strikes:
+            return max(itm_strikes)  # Highest strike below current price
+        return atm_strike
     else:  # PUT
-        strike = atm + 5
-    
-    return strike
+        # Get slightly ITM or ATM
+        itm_strikes = [s for s in available_strikes if s >= current_price]
+        if itm_strikes:
+            return min(itm_strikes)  # Lowest strike above current price
+        return atm_strike
 
 
 def calculate_stops(entry_price, direction, atr, config):
@@ -342,6 +417,11 @@ def place_scalp_order(bot, symbol, expiry, strike, direction, quantity=1):
         direction: 'CALL' or 'PUT'
         quantity: Number of contracts
     """
+    if strike is None:
+        logger.error(f"[ERROR] Cannot place order - invalid strike")
+        return
+    
+    logger.info(f"[ORDER] {symbol} {direction} @ ${strike} exp {expiry}")
     contract = create_option_contract(symbol, expiry, strike, direction[0])
     
     order = Order()
@@ -514,7 +594,12 @@ def scalping_loop(bot, symbols, expiry):
                     else:
                         logger.info("[SIGNAL] BULLISH trend continuation")
                     
-                    current_strike = find_scalping_strike(current_price, 'CALL')
+                    current_strike = find_scalping_strike(bot, symbol, expiry, current_price, 'CALL')
+                    if current_strike is None:
+                        logger.error("[ERROR] Could not find valid CALL strike")
+                        time.sleep(5)
+                        continue
+                    
                     current_direction = 'CALL'
                     
                     place_scalp_order(bot, symbol, expiry, current_strike, 'CALL')
@@ -533,7 +618,12 @@ def scalping_loop(bot, symbols, expiry):
                     else:
                         logger.info("[SIGNAL] BEARISH trend continuation")
                     
-                    current_strike = find_scalping_strike(current_price, 'PUT')
+                    current_strike = find_scalping_strike(bot, symbol, expiry, current_price, 'PUT')
+                    if current_strike is None:
+                        logger.error("[ERROR] Could not find valid PUT strike")
+                        time.sleep(5)
+                        continue
+                    
                     current_direction = 'PUT'
                     
                     place_scalp_order(bot, symbol, expiry, current_strike, 'PUT')
@@ -563,6 +653,11 @@ def scalping_loop(bot, symbols, expiry):
 
 def main():
     """Main entry point"""
+    # Suppress ib_insync debug logging for clean output
+    import logging
+    logging.getLogger('ib_insync.wrapper').setLevel(logging.ERROR)
+    logging.getLogger('ib_insync.client').setLevel(logging.ERROR)
+    
     print("\n" + "="*70)
     print("  OPTIONS SCALPER - SMART TRAILING STOPS")
     print("  Fast Calls/Puts Trading with Reversals")
@@ -590,15 +685,62 @@ def main():
     if isinstance(symbols, str):
         symbols = [symbols]
     
-    # Subscribe to market data for all symbols
+    # Step 1: Request contract details to get conIds
+    logger.info("Requesting contract details for futures...")
+    futures_contracts = {}
     reqId = 1
     for symbol in symbols:
-        futures = create_futures_contract(symbol, config['expiry'])
-        bot.reqMktData(reqId, futures, "", False, False, [])
+        futures = create_futures_contract(symbol, config.get('futures_expiry', '202512'))
+        futures_contracts[symbol] = futures
+        bot.reqContractDetails(reqId, futures)
+        logger.info(f"Requesting details for {symbol} (reqId={reqId})")
+        reqId += 1
+    
+    # Wait for contract details
+    logger.info("Waiting for contract details...")
+    time.sleep(3)
+    
+    # Step 2: Subscribe to market data using the contracts
+    logger.info("Subscribing to market data...")
+    reqId = 100
+    for symbol in symbols:
+        bot.reqMktData(reqId, futures_contracts[symbol], "", False, False, [])
         logger.info(f"Subscribed to {symbol} market data (reqId={reqId})")
         reqId += 1
     
     logger.info(f"Trading: {', '.join(symbols)}")
+    
+    # Wait for market data connections
+    time.sleep(2)
+    
+    # Step 3: REQUEST OPTION CHAINS using the qualified conIds
+    logger.info("Fetching option chains from IB...")
+    req_id = 1000
+    for idx, symbol in enumerate(symbols):
+        # Use the qualified conId if available, otherwise 0
+        conId = bot.futures_conIds.get(symbol, 0)
+        if conId > 0:
+            logger.info(f"Using conId={conId} for {symbol} option chain request")
+        else:
+            logger.warning(f"No conId for {symbol}, will try with underlyingSymbol only")
+        
+        bot.reqSecDefOptParams(req_id + idx, symbol, "CME", "FUT", conId)
+        logger.info(f"Requesting option chain for {symbol} on CME (reqId={req_id + idx})")
+    
+    # Wait for option chain data
+    logger.info("Waiting for option chain data...")
+    timeout = 15
+    while timeout > 0:
+        all_ready = all(sym in bot.chain_data_ready for sym in symbols)
+        if all_ready:
+            logger.info("[OK] All option chains loaded!")
+            break
+        time.sleep(1)
+        timeout -= 1
+    
+    if timeout == 0:
+        logger.warning("[WARN] Option chain data timeout - will use estimated strikes")
+    
     logger.info("Waiting for initial price data...")
     
     # Wait for price data
@@ -614,9 +756,9 @@ def main():
     
     time.sleep(2)
     
-    # Start scalping
+    # Start scalping (use options_expiry for FOP contracts)
     try:
-        scalping_loop(bot, symbols, config['expiry'])
+        scalping_loop(bot, symbols, config.get('options_expiry', config.get('expiry', '20251213')))
     except KeyboardInterrupt:
         logger.info("\nShutting down...")
     finally:
